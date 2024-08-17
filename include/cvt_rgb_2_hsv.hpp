@@ -200,6 +200,58 @@ class STLParallel final : public Backend<STLParallel>
     }
 };
 
+class STLThreads final : public Backend<STLThreads>
+{
+  public:
+    static constexpr std::string_view name = "STLThreads";
+    static size_t concurrency_limit;
+
+    template <typename... KernelTypes, typename... Args>
+    static inline constexpr size_t operator()(const size_t start, const size_t size, Args &&...args) noexcept
+    {
+        size_t concurrency = concurrency_limit;
+        if (concurrency == 0)
+        {
+            if (concurrency = std::thread::hardware_concurrency(); concurrency == 0) [[unlikely]]
+            {
+                return size;
+            }
+        }
+
+        const size_t seq_data_parallel = traits::cal_kernels_product<KernelTypes...>();
+        const size_t dispatcher_size = concurrency * seq_data_parallel;
+        const size_t chunk_size = size / dispatcher_size;
+
+        std::atomic<size_t> unprocessed = 0;
+        std::forward_list<std::thread> threads;
+        if (chunk_size > 0)
+        {
+            for (size_t i = 0; i < concurrency; ++i)
+            {
+                const size_t chunk_start = i * chunk_size;
+                threads.emplace_front([start, chunk_start, chunk_size, &unprocessed, &args...]() noexcept {
+                    unprocessed.fetch_add(
+                        Squential::template operator()<KernelTypes...>(start + chunk_start, chunk_size, args...));
+                });
+            }
+        }
+
+        const size_t remain = size % dispatcher_size;
+        const size_t remain_data_start = size - remain;
+        unprocessed.fetch_add(
+            Squential::template operator()<KernelTypes...>(start + remain_data_start, remain, args...));
+
+        for (auto &thread : threads)
+        {
+            thread.join();
+        }
+
+        return unprocessed.load();
+    }
+};
+
+size_t STLThreads::concurrency_limit = std::thread::hardware_concurrency();
+
 } // namespace backends
 
 namespace tasks
