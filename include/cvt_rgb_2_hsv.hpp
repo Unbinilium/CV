@@ -10,12 +10,210 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace cv
 {
+
+namespace traits
+{
+
+template <typename T, typename P> static constexpr bool compare_kernel()
+{
+    return T::data_parallel > P::data_parallel;
+}
+
+template <std::size_t... I, typename... Types>
+static constexpr bool compare_kernels_adjacent(std::index_sequence<I...>, std::tuple<Types...>)
+{
+    return (compare_kernel<std::tuple_element_t<I, std::tuple<Types...>>,
+                           std::tuple_element_t<I + 1, std::tuple<Types...>>>() &&
+            ...);
+}
+
+template <typename... Kernels> static constexpr bool is_kernels_convergent()
+{
+    if constexpr (sizeof...(Kernels) == 1)
+    {
+        return std::tuple_element_t<0, std::tuple<Kernels...>>::data_parallel == 1;
+    }
+    return compare_kernels_adjacent(std::make_index_sequence<sizeof...(Kernels) - 1>{}, std::tuple<Kernels...>{});
+}
+
+} // namespace traits
+
+template <typename KernelType> class Kernel
+{
+  public:
+    static constexpr std::string_view name = KernelType::name;
+    static constexpr size_t data_parallel = KernelType::data_parallel;
+
+    template <typename... Args> static inline constexpr void operator()(size_t index, Args &&...args) noexcept
+    {
+        return KernelType::operator()(index, std::forward<Args>(args)...);
+    }
+};
+
+template <typename BackendType> class Backend
+{
+  public:
+    static constexpr std::string_view name = BackendType::name;
+
+    template <typename... KernelTypes, typename... Args>
+    static inline constexpr bool operator()(size_t size, Args &&...args)
+    {
+        return BackendType::template operator()<KernelTypes...>(size, std::forward<Args>(args)...);
+    }
+};
+
+namespace kernels
+{
+
+template <typename ArtihmeticType = float> struct RGB2HSVPIL final : public Kernel<RGB2HSVPIL<ArtihmeticType>>
+{
+  public:
+    constexpr static std::string_view name = "PIL";
+    constexpr static size_t data_parallel = 1;
+
+    static inline constexpr void operator()(size_t index, const std::span<const uint8_t> &in_r,
+                                            const std::span<const uint8_t> &in_g, const std::span<const uint8_t> &in_b,
+                                            const std::span<uint8_t> &out_h, const std::span<uint8_t> &out_s,
+                                            const std::span<uint8_t> &out_v) noexcept
+    {
+        using T = ArtihmeticType;
+
+        const uint8_t r = in_r[index];
+        const uint8_t g = in_g[index];
+        const uint8_t b = in_b[index];
+
+        const uint8_t maxc = std::max(r, std::max(g, b));
+        const uint8_t minc = std::min(r, std::min(g, b));
+
+        T h, s, rc, gc, bc, cr;
+        uint8_t uh, us, uv;
+
+        uv = maxc;
+
+        if (minc == maxc)
+        {
+            uh = 0;
+            us = 0;
+        }
+        else
+        {
+            cr = static_cast<T>(maxc) - static_cast<T>(minc);
+            s = cr / static_cast<T>(maxc);
+
+            rc = static_cast<T>(maxc - r) / cr;
+            gc = static_cast<T>(maxc - g) / cr;
+            bc = static_cast<T>(maxc - b) / cr;
+
+            if (r == maxc)
+            {
+                h = bc - gc;
+            }
+            else if (g == maxc)
+            {
+                h = static_cast<T>(2.0) + rc - bc;
+            }
+            else
+            {
+                h = static_cast<T>(4.0) + gc - rc;
+            }
+
+            h = std::fmod((h / static_cast<T>(6.0)) + static_cast<T>(1.0), static_cast<T>(1.0));
+
+            uh = std::clamp(static_cast<uint8_t>(h * static_cast<T>(255.0)), static_cast<uint8_t>(0),
+                            static_cast<uint8_t>(255));
+            us = std::clamp(static_cast<uint8_t>(s * static_cast<T>(255.0)), static_cast<uint8_t>(0),
+                            static_cast<uint8_t>(255));
+        }
+
+        out_h[index] = uh;
+        out_s[index] = us;
+        out_v[index] = uv;
+    }
+};
+
+} // namespace kernels
+
+namespace backends
+{
+
+class Squential final : public Backend<Squential>
+{
+  public:
+    constexpr static std::string_view name = "Sequential";
+
+    template <typename... KernelTypes, typename... Args>
+    static inline constexpr bool operator()(size_t size, Args &&...args) noexcept
+    {
+        ((size = dispatch<KernelTypes>(size, std::forward<Args>(args)...)), ...);
+        return size == 0;
+    }
+
+  protected:
+    template <typename KernelType, typename... Args>
+    static inline constexpr size_t dispatch(size_t remain, Args &&...args) noexcept
+    {
+        const size_t data_parallel = KernelType::data_parallel;
+        while (remain >= data_parallel)
+        {
+            remain -= data_parallel;
+            KernelType::operator()(remain, std::forward<Args>(args)...);
+        }
+        return remain;
+    }
+};
+
+} // namespace backends
+
+namespace tasks
+{
+
+namespace detail
+{
+
+template <typename BackendType, typename... KernelTypes, size_t... Indices>
+static inline constexpr bool cvtColor(std::span<const uint8_t> in, std::span<uint8_t> out,
+                                      std::index_sequence<Indices...>) noexcept
+{
+    constexpr size_t channels = sizeof...(Indices);
+
+    const auto in_size = in.size();
+    const auto out_size = out.size();
+    if (in_size != out_size) [[unlikely]]
+    {
+        return false;
+    }
+    if (in_size % channels != 0) [[unlikely]]
+    {
+        return false;
+    }
+
+    // Channels,H,W
+    const size_t layer_size = in_size / channels;
+
+    return BackendType::template operator()<KernelTypes...>(layer_size, in.subspan(Indices * layer_size, layer_size)...,
+                                                            out.subspan(Indices * layer_size, layer_size)...);
+}
+
+} // namespace detail
+
+template <size_t Channels, typename BackendType, typename... KernelTypes>
+static inline constexpr bool cvtColor(std::span<const uint8_t> in, std::span<uint8_t> out) noexcept
+{
+    static_assert(
+        traits::is_kernels_convergent<KernelTypes...>(),
+        "All kernels must have a data_parallel value that converges to 1 for the last kernel in the sequence");
+
+    return detail::cvtColor<BackendType, KernelTypes...>(in, out, std::make_index_sequence<Channels>{});
+}
+
+} // namespace tasks
 
 template <size_t DataParallel = 1, typename ArtihmeticType = float> struct KernelPIL final
 {
