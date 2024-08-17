@@ -278,14 +278,16 @@ class STLParallel final : public Backend<STLParallel>
         const size_t remain = size % seq_data_parallel;
         const size_t view_end = start + size - remain;
         auto par_data_chunk_iter = std::ranges::iota_view(start, view_end);
-        size_t unprocessed = std::transform_reduce(
-            std::execution::par_unseq, par_data_chunk_iter.begin(), par_data_chunk_iter.end(), size_t{0},
-            ::std::plus<size_t>{}, [seq_data_parallel, &args...](const auto i) noexcept {
-                return Sequential::template operator()<KernelTypes...>(i, seq_data_parallel, args...);
-            });
+        size_t unprocessed = std::transform_reduce(std::execution::par_unseq, par_data_chunk_iter.begin(),
+                                                   par_data_chunk_iter.end(), size_t{0}, ::std::plus<size_t>{},
+                                                   [seq_data_parallel, &args...](const auto i) noexcept {
+                                                       return Sequential::template operator()<KernelTypes...>(
+                                                           i, seq_data_parallel, std::forward<Args>(args)...);
+                                                   });
         if (remain > 0)
         {
-            unprocessed += Sequential::template operator()<KernelTypes...>(view_end, remain, args...);
+            unprocessed +=
+                Sequential::template operator()<KernelTypes...>(view_end, remain, std::forward<Args>(args)...);
         }
         return unprocessed;
     }
@@ -318,16 +320,16 @@ class STLThreads final : public Backend<STLThreads>
             {
                 const size_t chunk_start = i * chunk_size;
                 threads.emplace_front([start, chunk_start, chunk_size, &unprocessed, &args...]() noexcept {
-                    unprocessed.fetch_add(
-                        Sequential::template operator()<KernelTypes...>(start + chunk_start, chunk_size, args...));
+                    unprocessed.fetch_add(Sequential::template operator()<KernelTypes...>(
+                        start + chunk_start, chunk_size, std::forward<Args>(args)...));
                 });
             }
         }
         if (const size_t remain = size % dispatcher_size; remain > 0)
         {
             const size_t remain_data_start = size - remain;
-            unprocessed.fetch_add(
-                Sequential::template operator()<KernelTypes...>(start + remain_data_start, remain, args...));
+            unprocessed.fetch_add(Sequential::template operator()<KernelTypes...>(start + remain_data_start, remain,
+                                                                                  std::forward<Args>(args)...));
         }
         for (auto &thread : threads)
         {
