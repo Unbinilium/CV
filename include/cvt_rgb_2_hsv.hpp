@@ -28,7 +28,7 @@ namespace traits
 
 template <typename T, typename P> static constexpr bool compare_kernel()
 {
-    return T::data_parallel >= P::data_parallel;
+    return T::data_parallel > P::data_parallel;
 }
 
 template <size_t... I, typename... Types>
