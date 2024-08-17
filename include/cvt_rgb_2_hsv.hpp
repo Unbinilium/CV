@@ -16,6 +16,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 namespace cv
 {
 
@@ -24,7 +28,7 @@ namespace traits
 
 template <typename T, typename P> static constexpr bool compare_kernel()
 {
-    return T::data_parallel > P::data_parallel;
+    return T::data_parallel >= P::data_parallel;
 }
 
 template <size_t... I, typename... Types>
@@ -80,10 +84,10 @@ template <typename BackendType> class Backend
 namespace kernels
 {
 
-template <typename ArtihmeticType = float> struct RGB2HSVPIL final : public Kernel<RGB2HSVPIL<ArtihmeticType>>
+template <typename ArtihmeticType = float> class RGB2HSVPIL final : public Kernel<RGB2HSVPIL<ArtihmeticType>>
 {
   public:
-    static constexpr std::string_view name = "PIL";
+    static constexpr std::string_view name = "RGB2HSVPIL";
     static constexpr size_t data_parallel = 1;
 
     static inline constexpr void operator()(size_t index, const std::span<const uint8_t> &in_r,
@@ -146,12 +150,97 @@ template <typename ArtihmeticType = float> struct RGB2HSVPIL final : public Kern
     }
 };
 
+template <size_t HRangeMax = 180> class RGB2HSVCV final : public Kernel<RGB2HSVCV<HRangeMax>>
+{
+  public:
+    static constexpr std::string_view name = "RGB2HSVCV";
+    static constexpr size_t data_parallel = 1;
+
+    static inline constexpr void operator()(size_t index, const std::span<const uint8_t> &in_r,
+                                            const std::span<const uint8_t> &in_g, const std::span<const uint8_t> &in_b,
+                                            const std::span<uint8_t> &out_h, const std::span<uint8_t> &out_s,
+                                            const std::span<uint8_t> &out_v) noexcept
+    {
+        const uint8_t r = in_r[index];
+        const uint8_t g = in_g[index];
+        const uint8_t b = in_b[index];
+
+        int h, s, v = b;
+        int vmin = b, diff;
+        int vr, vg;
+
+        v = std::max(static_cast<uint8_t>(v), g);
+        v = std::max(static_cast<uint8_t>(v), r);
+        vmin = std::min(static_cast<uint8_t>(vmin), g);
+        vmin = std::min(static_cast<uint8_t>(vmin), r);
+
+        diff = v - vmin;
+        vr = v == r ? -1 : 0;
+        vg = v == g ? -1 : 0;
+
+        s = diff * div_table[v] >> hsv_shift;
+        h = (vr & (g - b)) + (~vr & ((vg & (b - r + (2 * diff))) + ((~vg) & (r - g + (4 * diff)))));
+        h = (h * div_table[diff] * h_scale + (1 << (hsv_shift + 6))) >> (7 + hsv_shift);
+        h += h < 0 ? h_range_max : 0;
+
+        out_h[index] = static_cast<uint8_t>(h);
+        out_s[index] = static_cast<uint8_t>(s);
+        out_v[index] = static_cast<uint8_t>(v);
+    }
+
+  private:
+    static constexpr int h_range_max = HRangeMax;
+    static_assert(h_range_max == 180 || h_range_max == 256);
+    static constexpr int h_scale = h_range_max == 180 ? 15 : 21;
+    static constexpr int hsv_shift = 12;
+
+    static constexpr auto div_table{[]() noexcept {
+        std::array<int, 256> table;
+        table[0] = 0;
+        for (size_t i = 1; i < table.size(); ++i)
+        {
+            table[i] = (1 << 14) / i;
+        }
+        return table;
+    }()};
+};
+
+#ifdef __ARM_NEON
+
+// class RGB2HSVNeon final : public Kernel<RGB2HSVNeon>
+// {
+//   public:
+//     static constexpr std::string_view name = "RGB2HSVNeon";
+//     static constexpr size_t data_parallel = 16;
+
+//     static inline constexpr void operator()(size_t index, const std::span<const uint8_t> &in_r,
+//                                             const std::span<const uint8_t> &in_g, const std::span<const uint8_t>
+//                                             &in_b, const std::span<uint8_t> &out_h, const std::span<uint8_t> &out_s,
+//                                             const std::span<uint8_t> &out_v) noexcept
+//     {
+//         uint8x16_t r_vec = vld1q_u8(&in_r[index]);
+//         uint8x16_t g_vec = vld1q_u8(&in_g[index]);
+//         uint8x16_t b_vec = vld1q_u8(&in_b[index]);
+
+//         uint8x16_t maxc = vmaxq_u8(r_vec, vmaxq_u8(g_vec, b_vec));
+//         uint8x16_t minc = vminq_u8(r_vec, vminq_u8(g_vec, b_vec));
+
+//         uint8x16_t eq = vceqq_u8(minc, maxc);
+//         uint8x16_t uh = vdupq_n_u8(0);
+//         uint8x16_t us = vdupq_n_u8(0);
+
+//         // TODO: Implement the rest of the kernel
+//     }
+// };
+
+#endif
+
 } // namespace kernels
 
 namespace backends
 {
 
-class Squential final : public Backend<Squential>
+class Sequential final : public Backend<Sequential>
 {
   public:
     static constexpr std::string_view name = "Sequential";
@@ -186,17 +275,19 @@ class STLParallel final : public Backend<STLParallel>
     static inline constexpr size_t operator()(const size_t start, const size_t size, Args &&...args) noexcept
     {
         constexpr size_t seq_data_parallel = traits::cal_kernels_product<KernelTypes...>();
-        auto par_data_chunk_iter = std::ranges::iota_view(start, start + size) | std::views::stride(seq_data_parallel) |
-                                   std::views::reverse | std::views::drop(1);
-        size_t remain = std::transform_reduce(
-            std::execution::seq, par_data_chunk_iter.begin(), par_data_chunk_iter.end(), size_t{0},
+        const size_t remain = size % seq_data_parallel;
+        const size_t view_end = start + size - remain;
+        auto par_data_chunk_iter = std::ranges::iota_view(start, view_end);
+        size_t unprocessed = std::transform_reduce(
+            std::execution::par_unseq, par_data_chunk_iter.begin(), par_data_chunk_iter.end(), size_t{0},
             ::std::plus<size_t>{}, [seq_data_parallel, &args...](const auto i) noexcept {
-                return Squential::template operator()<KernelTypes...>(i, seq_data_parallel, args...);
+                return Sequential::template operator()<KernelTypes...>(i, seq_data_parallel, args...);
             });
-        const size_t last_chunk_start =
-            (par_data_chunk_iter.size() ? par_data_chunk_iter.back() : start) + seq_data_parallel;
-        remain += Squential::template operator()<KernelTypes...>(last_chunk_start, size - last_chunk_start, args...);
-        return remain;
+        if (remain > 0)
+        {
+            unprocessed += Sequential::template operator()<KernelTypes...>(view_end, remain, args...);
+        }
+        return unprocessed;
     }
 };
 
@@ -217,35 +308,31 @@ class STLThreads final : public Backend<STLThreads>
                 return size;
             }
         }
-
         const size_t seq_data_parallel = traits::cal_kernels_product<KernelTypes...>();
         const size_t dispatcher_size = concurrency * seq_data_parallel;
-        const size_t chunk_size = size / dispatcher_size;
-
         std::atomic<size_t> unprocessed = 0;
         std::forward_list<std::thread> threads;
-        if (chunk_size > 0)
+        if (const size_t chunk_size = size / dispatcher_size; chunk_size > 0)
         {
             for (size_t i = 0; i < concurrency; ++i)
             {
                 const size_t chunk_start = i * chunk_size;
                 threads.emplace_front([start, chunk_start, chunk_size, &unprocessed, &args...]() noexcept {
                     unprocessed.fetch_add(
-                        Squential::template operator()<KernelTypes...>(start + chunk_start, chunk_size, args...));
+                        Sequential::template operator()<KernelTypes...>(start + chunk_start, chunk_size, args...));
                 });
             }
         }
-
-        const size_t remain = size % dispatcher_size;
-        const size_t remain_data_start = size - remain;
-        unprocessed.fetch_add(
-            Squential::template operator()<KernelTypes...>(start + remain_data_start, remain, args...));
-
+        if (const size_t remain = size % dispatcher_size; remain > 0)
+        {
+            const size_t remain_data_start = size - remain;
+            unprocessed.fetch_add(
+                Sequential::template operator()<KernelTypes...>(start + remain_data_start, remain, args...));
+        }
         for (auto &thread : threads)
         {
             thread.join();
         }
-
         return unprocessed.load();
     }
 };
@@ -298,279 +385,5 @@ static inline constexpr bool cvtColor(std::span<const uint8_t> in, std::span<uin
 }
 
 } // namespace tasks
-
-template <size_t DataParallel = 1, typename ArtihmeticType = float> struct KernelPIL final
-{
-    constexpr static std::string_view name = "PIL";
-    constexpr static size_t data_parallel = DataParallel;
-    using fallback_kernel_type = KernelPIL<1, ArtihmeticType>;
-
-    using artihmetic_type = ArtihmeticType;
-};
-
-template <typename KT,
-          typename std::enable_if_t<std::is_same_v<KT, KernelPIL<1, float>> || std::is_same_v<KT, KernelPIL<1, double>>,
-                                    bool> = true>
-constexpr static inline void cvtRGB2HSVKernel(const uint8_t r, const uint8_t g, const uint8_t b, uint8_t &out_h,
-                                              uint8_t &out_s, uint8_t &out_v) noexcept
-{
-    using T = typename KT::artihmetic_type;
-
-    const uint8_t maxc = std::max(r, std::max(g, b));
-    const uint8_t minc = std::min(r, std::min(g, b));
-
-    T h, s, rc, gc, bc, cr;
-    uint8_t uh, us, uv;
-
-    uv = maxc;
-
-    if (minc == maxc)
-    {
-        uh = 0;
-        us = 0;
-    }
-    else
-    {
-        cr = static_cast<T>(maxc) - static_cast<T>(minc);
-        s = cr / static_cast<T>(maxc);
-
-        rc = static_cast<T>(maxc - r) / cr;
-        gc = static_cast<T>(maxc - g) / cr;
-        bc = static_cast<T>(maxc - b) / cr;
-
-        if (r == maxc)
-        {
-            h = bc - gc;
-        }
-        else if (g == maxc)
-        {
-            h = static_cast<T>(2.0) + rc - bc;
-        }
-        else
-        {
-            h = static_cast<T>(4.0) + gc - rc;
-        }
-
-        h = std::fmod((h / static_cast<T>(6.0)) + static_cast<T>(1.0), static_cast<T>(1.0));
-
-        uh = std::clamp(static_cast<uint8_t>(h * static_cast<T>(255.0)), static_cast<uint8_t>(0),
-                        static_cast<uint8_t>(255));
-        us = std::clamp(static_cast<uint8_t>(s * static_cast<T>(255.0)), static_cast<uint8_t>(0),
-                        static_cast<uint8_t>(255));
-    }
-
-    out_h = uh;
-    out_s = us;
-    out_v = uv;
-}
-
-template <size_t DataParallel = 1, int HRangeMax = 180> struct KernelCV final
-{
-    constexpr static std::string_view name = "CV";
-    constexpr static size_t data_parallel = DataParallel;
-    using fallback_kernel_type = KernelCV<1, HRangeMax>;
-
-    static constexpr int h_range_max = HRangeMax;
-    static constexpr int h_scale = h_range_max == 180 ? 15 : 21;
-
-    static constexpr auto div_table{[]() noexcept {
-        std::array<int, 256> table;
-        table[0] = 0;
-        for (size_t i = 1; i < table.size(); i++)
-        {
-            table[i] = (1 << 14) / i;
-        }
-        return table;
-    }()};
-};
-
-template <typename KT, typename std::enable_if_t<
-                           std::is_same_v<KT, KernelCV<1, 180>> || std::is_same_v<KT, KernelCV<1, 256>>, bool> = true>
-constexpr static inline void cvtRGB2HSVKernel(const uint8_t r, const uint8_t g, const uint8_t b, uint8_t &out_h,
-                                              uint8_t &out_s, uint8_t &out_v) noexcept
-{
-    constexpr int hsv_shift = 12;
-
-    int h, s, v = b;
-    int vmin = b, diff;
-    int vr, vg;
-
-    v = std::max(static_cast<uint8_t>(v), g);
-    v = std::max(static_cast<uint8_t>(v), r);
-    vmin = std::min(static_cast<uint8_t>(vmin), g);
-    vmin = std::min(static_cast<uint8_t>(vmin), r);
-
-    diff = v - vmin;
-    vr = v == r ? -1 : 0;
-    vg = v == g ? -1 : 0;
-
-    s = diff * KT::div_table[v] >> hsv_shift;
-    h = (vr & (g - b)) + (~vr & ((vg & (b - r + (2 * diff))) + ((~vg) & (r - g + (4 * diff)))));
-    h = (h * KT::div_table[diff] * KT::h_scale + (1 << (hsv_shift + 6))) >> (7 + hsv_shift);
-    h += h < 0 ? KT::h_range_max : 0;
-
-    out_h = static_cast<uint8_t>(h);
-    out_s = static_cast<uint8_t>(s);
-    out_v = static_cast<uint8_t>(v);
-}
-
-template <size_t DataParallel = 8> struct KernelNeon final
-{
-    constexpr static std::string_view name = "Neon";
-    constexpr static size_t data_parallel = DataParallel;
-    using fallback_kernel_type = KernelPIL<1, float>;
-};
-
-#include <arm_neon.h>
-
-template <typename KT, typename std::enable_if_t<std::is_same_v<KT, KernelNeon<8>>, bool> = true>
-constexpr static inline void cvtRGB2HSVKernel(const uint8_t &r, const uint8_t &g, const uint8_t &b, uint8_t &out_h,
-                                              uint8_t &out_s, uint8_t &out_v) noexcept
-{
-    uint8x16_t r_vec = vld1q_u8(&r);
-    uint8x16_t g_vec = vld1q_u8(&g);
-    uint8x16_t b_vec = vld1q_u8(&b);
-
-    uint8x16_t maxc = vmaxq_u8(r_vec, vmaxq_u8(g_vec, b_vec));
-    uint8x16_t minc = vminq_u8(r_vec, vminq_u8(g_vec, b_vec));
-
-    uint8x16_t uv = maxc;
-
-    uint8x16_t eq = vceqq_u8(minc, maxc);
-    uint8x16_t uh = vdupq_n_u8(0);
-    uint8x16_t us = vdupq_n_u8(0);
-
-    // TODO: Implement the rest of the kernel
-}
-
-struct BackendSequential final
-{
-    constexpr static std::string_view name = "Sequential";
-};
-
-struct BackendStdExecution final
-{
-    constexpr static std::string_view name = "StdExecution";
-};
-
-struct BackendThread final
-{
-    constexpr static std::string_view name = "Thread";
-};
-
-template <typename BackendType, typename KernelType, typename FallbackKernelType = KernelType::fallback_kernel_type>
-constexpr static inline bool cvtRGB2HSV(std::span<const uint8_t> in, std::span<uint8_t> out) noexcept
-{
-    const auto in_size = in.size();
-    const auto out_size = out.size();
-    if (in_size != out_size) [[unlikely]]
-    {
-        return false;
-    }
-    if (in_size % 3 != 0) [[unlikely]]
-    {
-        return false;
-    }
-
-    // 3,H,W
-    const size_t layer_size = in_size / 3;
-
-    const auto r_span = in.subspan(0, layer_size);
-    const auto g_span = in.subspan(layer_size, layer_size);
-    const auto b_span = in.subspan(2 * layer_size, layer_size);
-
-    auto h_span = out.subspan(0, layer_size);
-    auto s_span = out.subspan(layer_size, layer_size);
-    auto v_span = out.subspan(2 * layer_size, layer_size);
-
-    static_assert(KernelType::data_parallel >= 1);
-    static_assert(FallbackKernelType::data_parallel == 1);
-
-    if constexpr (std::is_same_v<BackendType, BackendSequential>)
-    {
-        constexpr size_t data_parallel = KernelType::data_parallel;
-        size_t remain = layer_size;
-        while (remain >= data_parallel)
-        {
-            remain -= data_parallel;
-            cvtRGB2HSVKernel<KernelType>(r_span[remain], g_span[remain], b_span[remain], h_span[remain], s_span[remain],
-                                         v_span[remain]);
-        }
-        for (size_t i = 0; i < remain; ++i)
-        {
-            cvtRGB2HSVKernel<FallbackKernelType>(r_span[i], g_span[i], b_span[i], h_span[i], s_span[i], v_span[i]);
-        }
-    }
-    else if constexpr (std::is_same_v<BackendType, BackendStdExecution>)
-    {
-        constexpr size_t data_parallel = KernelType::data_parallel;
-        auto data_iter = std::ranges::iota_view(0ul, layer_size) | std::views::stride(data_parallel) |
-                         std::views::reverse | std::views::drop(1);
-        std::for_each(std::execution::par_unseq, data_iter.begin(), data_iter.end(),
-                      [&r_span, &g_span, &b_span, &h_span, &s_span, &v_span](const auto i) noexcept {
-                          cvtRGB2HSVKernel<KernelType>(r_span[i], g_span[i], b_span[i], h_span[i], s_span[i],
-                                                       v_span[i]);
-                      });
-        const auto remain = layer_size % data_parallel;
-        for (size_t i = layer_size - remain; i < layer_size; ++i)
-        {
-            cvtRGB2HSVKernel<FallbackKernelType>(r_span[i], g_span[i], b_span[i], h_span[i], s_span[i], v_span[i]);
-        }
-    }
-    else if constexpr (std::is_same_v<BackendType, BackendThread>)
-    {
-        const size_t concurrency = std::thread::hardware_concurrency();
-        if (concurrency == 0) [[unlikely]]
-        {
-            return false;
-        }
-        constexpr size_t data_parallel = KernelType::data_parallel;
-        const size_t dispatcher_size = concurrency * data_parallel;
-        const size_t chunk_size = layer_size / dispatcher_size;
-        const size_t remain = layer_size % dispatcher_size;
-
-        std::forward_list<std::thread> threads;
-        auto concurrency_iter = std::ranges::iota_view(0ul, std::min(concurrency, chunk_size));
-        for (const auto i : concurrency_iter)
-        {
-            const size_t start = i * chunk_size;
-            const size_t end = start + chunk_size;
-            threads.emplace_front(
-                [start, end, data_parallel, &r_span, &g_span, &b_span, &h_span, &s_span, &v_span] noexcept {
-                    for (size_t i = start; i < end; i += data_parallel)
-                    {
-                        cvtRGB2HSVKernel<KernelType>(r_span[i], g_span[i], b_span[i], h_span[i], s_span[i], v_span[i]);
-                    }
-                });
-        }
-
-        const size_t remain_data_start = layer_size - remain;
-        const size_t remain_group_size = remain / data_parallel;
-        const size_t remain_remain = remain % data_parallel;
-
-        for (size_t i = 0, start = remain_data_start; i < remain_group_size; ++i, start += data_parallel)
-        {
-            cvtRGB2HSVKernel<KernelType>(r_span[start], g_span[start], b_span[start], h_span[start], s_span[start],
-                                         v_span[start]);
-        }
-
-        for (size_t i = 0, start = layer_size - remain_remain; i < remain_remain; ++i, ++start)
-        {
-            cvtRGB2HSVKernel<FallbackKernelType>(r_span[start], g_span[start], b_span[start], h_span[start],
-                                                 s_span[start], v_span[start]);
-        }
-
-        for (auto &thread : threads)
-        {
-            thread.join();
-        }
-    }
-    else
-    {
-        return false;
-    }
-
-    return true;
-}
 
 } // namespace cv
