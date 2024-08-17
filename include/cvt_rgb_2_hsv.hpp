@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <execution>
@@ -26,7 +27,7 @@ template <typename T, typename P> static constexpr bool compare_kernel()
     return T::data_parallel > P::data_parallel;
 }
 
-template <std::size_t... I, typename... Types>
+template <size_t... I, typename... Types>
 static constexpr bool compare_kernels_adjacent(std::index_sequence<I...>, std::tuple<Types...>)
 {
     return (compare_kernel<std::tuple_element_t<I, std::tuple<Types...>>,
@@ -41,6 +42,13 @@ template <typename... Kernels> static constexpr bool is_kernels_convergent()
         return std::tuple_element_t<0, std::tuple<Kernels...>>::data_parallel == 1;
     }
     return compare_kernels_adjacent(std::make_index_sequence<sizeof...(Kernels) - 1>{}, std::tuple<Kernels...>{});
+}
+
+template <typename... Kernels> static constexpr size_t cal_kernels_product()
+{
+    size_t product = 1;
+    ((product *= Kernels::data_parallel), ...);
+    return product;
 }
 
 } // namespace traits
@@ -75,8 +83,8 @@ namespace kernels
 template <typename ArtihmeticType = float> struct RGB2HSVPIL final : public Kernel<RGB2HSVPIL<ArtihmeticType>>
 {
   public:
-    constexpr static std::string_view name = "PIL";
-    constexpr static size_t data_parallel = 1;
+    static constexpr std::string_view name = "PIL";
+    static constexpr size_t data_parallel = 1;
 
     static inline constexpr void operator()(size_t index, const std::span<const uint8_t> &in_r,
                                             const std::span<const uint8_t> &in_g, const std::span<const uint8_t> &in_b,
@@ -146,25 +154,48 @@ namespace backends
 class Squential final : public Backend<Squential>
 {
   public:
-    constexpr static std::string_view name = "Sequential";
+    static constexpr std::string_view name = "Sequential";
 
     template <typename... KernelTypes, typename... Args>
-    static inline constexpr bool operator()(size_t size, Args &&...args) noexcept
+    static inline constexpr size_t operator()(size_t start, const size_t size, Args &&...args) noexcept
     {
-        ((size = dispatch<KernelTypes>(size, std::forward<Args>(args)...)), ...);
-        return size == 0;
+        const size_t end = start + size;
+        (dispatch<KernelTypes>(start, end, std::forward<Args>(args)...), ...);
+        return end - start;
     }
 
-  protected:
+  private:
     template <typename KernelType, typename... Args>
-    static inline constexpr size_t dispatch(size_t remain, Args &&...args) noexcept
+    static inline constexpr void dispatch(size_t &start, const size_t end, Args &&...args) noexcept
     {
-        const size_t data_parallel = KernelType::data_parallel;
-        while (remain >= data_parallel)
+        constexpr size_t data_parallel = KernelType::data_parallel;
+        while (start < end)
         {
-            remain -= data_parallel;
-            KernelType::operator()(remain, std::forward<Args>(args)...);
+            KernelType::operator()(start, std::forward<Args>(args)...);
+            start += data_parallel;
         }
+    }
+};
+
+class STLParallel final : public Backend<STLParallel>
+{
+  public:
+    static constexpr std::string_view name = "STLParallel";
+
+    template <typename... KernelTypes, typename... Args>
+    static inline constexpr size_t operator()(const size_t start, const size_t size, Args &&...args) noexcept
+    {
+        constexpr size_t seq_data_parallel = traits::cal_kernels_product<KernelTypes...>();
+        auto par_data_chunk_iter = std::ranges::iota_view(start, start + size) | std::views::stride(seq_data_parallel) |
+                                   std::views::reverse | std::views::drop(1);
+        size_t remain = std::transform_reduce(
+            std::execution::seq, par_data_chunk_iter.begin(), par_data_chunk_iter.end(), size_t{0},
+            ::std::plus<size_t>{}, [seq_data_parallel, &args...](const auto i) noexcept {
+                return Squential::template operator()<KernelTypes...>(i, seq_data_parallel, args...);
+            });
+        const size_t last_chunk_start =
+            (par_data_chunk_iter.size() ? par_data_chunk_iter.back() : start) + seq_data_parallel;
+        remain += Squential::template operator()<KernelTypes...>(last_chunk_start, size - last_chunk_start, args...);
         return remain;
     }
 };
@@ -197,8 +228,9 @@ static inline constexpr bool cvtColor(std::span<const uint8_t> in, std::span<uin
     // Channels,H,W
     const size_t layer_size = in_size / channels;
 
-    return BackendType::template operator()<KernelTypes...>(layer_size, in.subspan(Indices * layer_size, layer_size)...,
-                                                            out.subspan(Indices * layer_size, layer_size)...);
+    return BackendType::template operator()<KernelTypes...>(0, layer_size,
+                                                            in.subspan(Indices * layer_size, layer_size)...,
+                                                            out.subspan(Indices * layer_size, layer_size)...) == 0;
 }
 
 } // namespace detail
