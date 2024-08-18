@@ -232,7 +232,7 @@ template <size_t HRangeMax = 180> class RGB2HSVCV final : public Kernel<RGB2HSVC
 template <size_t HRangeMax = 180> class RGB2HSVCVNeonAAarch64 final : public Kernel<RGB2HSVCVNeonAAarch64<HRangeMax>>
 {
   public:
-    static constexpr std::string_view name = "RGB2HSVNeon";
+    static constexpr std::string_view name = "RGB2HSVCVNeonAAarch64";
     static constexpr size_t data_parallel = 16;
 
     static inline constexpr void operator()(size_t index, const std::span<const uint8_t> &in_r,
