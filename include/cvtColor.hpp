@@ -1,11 +1,16 @@
 #pragma once
 
+#if __cplusplus < 202002L
+#error "C++20 or later is required"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <execution>
 #include <forward_list>
+#include <numeric>
 #include <ranges>
 #include <span>
 #include <stdexcept>
@@ -22,6 +27,23 @@
 
 namespace cv
 {
+
+namespace utils
+{
+template <typename T> static inline constexpr T saturate_cast(T value) noexcept
+{
+    if (value > std::numeric_limits<T>::max())
+    {
+        return std::numeric_limits<T>::max();
+    }
+    else if (value < std::numeric_limits<T>::min())
+    {
+        return std::numeric_limits<T>::min();
+    }
+    return static_cast<T>(value);
+}
+
+} // namespace utils
 
 namespace traits
 {
@@ -205,33 +227,208 @@ template <size_t HRangeMax = 180> class RGB2HSVCV final : public Kernel<RGB2HSVC
     }()};
 };
 
-#ifdef __ARM_NEON
+#if defined(__ARM_NEON) && (defined(__ARM_64BIT_STATE) || defined(_M_ARM64))
 
-// class RGB2HSVNeon final : public Kernel<RGB2HSVNeon>
-// {
-//   public:
-//     static constexpr std::string_view name = "RGB2HSVNeon";
-//     static constexpr size_t data_parallel = 16;
+template <size_t HRangeMax = 180> class RGB2HSVCVNeonAAarch64 final : public Kernel<RGB2HSVCVNeonAAarch64<HRangeMax>>
+{
+  public:
+    static constexpr std::string_view name = "RGB2HSVNeon";
+    static constexpr size_t data_parallel = 16;
 
-//     static inline constexpr void operator()(size_t index, const std::span<const uint8_t> &in_r,
-//                                             const std::span<const uint8_t> &in_g, const std::span<const uint8_t>
-//                                             &in_b, const std::span<uint8_t> &out_h, const std::span<uint8_t> &out_s,
-//                                             const std::span<uint8_t> &out_v) noexcept
-//     {
-//         uint8x16_t r_vec = vld1q_u8(&in_r[index]);
-//         uint8x16_t g_vec = vld1q_u8(&in_g[index]);
-//         uint8x16_t b_vec = vld1q_u8(&in_b[index]);
+    static inline constexpr void operator()(size_t index, const std::span<const uint8_t> &in_r,
+                                            const std::span<const uint8_t> &in_g, const std::span<const uint8_t> &in_b,
+                                            const std::span<uint8_t> &out_h, const std::span<uint8_t> &out_s,
+                                            const std::span<uint8_t> &out_v) noexcept
+    {
+        uint8x16_t r = vld1q_u8(&in_r[index]);
+        uint8x16_t g = vld1q_u8(&in_g[index]);
+        uint8x16_t b = vld1q_u8(&in_b[index]);
 
-//         uint8x16_t maxc = vmaxq_u8(r_vec, vmaxq_u8(g_vec, b_vec));
-//         uint8x16_t minc = vminq_u8(r_vec, vminq_u8(g_vec, b_vec));
+        uint8x16_t h, s, v;
+        uint8x16_t vmin;
 
-//         uint8x16_t eq = vceqq_u8(minc, maxc);
-//         uint8x16_t uh = vdupq_n_u8(0);
-//         uint8x16_t us = vdupq_n_u8(0);
+        v = vmaxq_u8(b, vmaxq_u8(g, r));
+        vmin = vminq_u8(b, vminq_u8(g, r));
 
-//         // TODO: Implement the rest of the kernel
-//     }
-// };
+        uint8x16_t diff, vr, vg;
+        diff = vsubq_u8(v, vmin);
+        uint8x16_t v255 = vdupq_n_u8(255), vz = vdupq_n_u8(0);
+        vr = vbslq_u8(vceqq_u8(v, r), v255, vz);
+        vg = vbslq_u8(vceqq_u8(v, g), v255, vz);
+
+        int32x4_t sdiv0, sdiv1, sdiv2, sdiv3;
+        uint16x8_t vd0, vd1;
+        v_expand(v, vd0, vd1);
+        int32x4_t vq0, vq1, vq2, vq3;
+        v_expand(vd0, vq0, vq1);
+        v_expand(vd1, vq2, vq3);
+
+        {
+            alignas(32) int32_t storevq[16];
+            vst1q_s32(storevq, vq0);
+            vst1q_s32(storevq + 4, vq1);
+            vst1q_s32(storevq + 8, vq2);
+            vst1q_s32(storevq + 12, vq3);
+
+            v_lut(sdiv0, s_div_table, storevq);
+            v_lut(sdiv1, s_div_table, storevq + 4);
+            v_lut(sdiv2, s_div_table, storevq + 8);
+            v_lut(sdiv3, s_div_table, storevq + 12);
+        }
+
+        int32x4_t hdiv0, hdiv1, hdiv2, hdiv3;
+        uint16x8_t diffd0, diffd1;
+        v_expand(diff, diffd0, diffd1);
+        int32x4_t diffq0, diffq1, diffq2, diffq3;
+        v_expand(diffd0, diffq0, diffq1);
+        v_expand(diffd1, diffq2, diffq3);
+        {
+            alignas(32) int32_t storediffq[16];
+            vst1q_s32(storediffq, diffq0);
+            vst1q_s32(storediffq + 4, diffq1);
+            vst1q_s32(storediffq + 8, diffq2);
+            vst1q_s32(storediffq + 12, diffq3);
+
+            v_lut(hdiv0, h_div_table, storediffq);
+            v_lut(hdiv1, h_div_table, storediffq + 4);
+            v_lut(hdiv2, h_div_table, storediffq + 8);
+            v_lut(hdiv3, h_div_table, storediffq + 12);
+        }
+
+        int32x4_t sq0, sq1, sq2, sq3;
+        int32x4_t vdescale = vdupq_n_s32(1 << (hsv_shift - 1));
+        v_shr<hsv_shift>(sq0, vaddq_s32(vmulq_s32(diffq0, sdiv0), vdescale));
+        v_shr<hsv_shift>(sq1, vaddq_s32(vmulq_s32(diffq1, sdiv1), vdescale));
+        v_shr<hsv_shift>(sq2, vaddq_s32(vmulq_s32(diffq2, sdiv2), vdescale));
+        v_shr<hsv_shift>(sq3, vaddq_s32(vmulq_s32(diffq3, sdiv3), vdescale));
+        int16x8_t sd0, sd1;
+        v_pack(sd0, sq0, sq1);
+        v_pack(sd1, sq2, sq3);
+        v_pack(s, sd0, sd1);
+
+        uint16x8_t bdu0, bdu1, gdu0, gdu1, rdu0, rdu1;
+        v_expand(b, bdu0, bdu1);
+        v_expand(g, gdu0, gdu1);
+        v_expand(r, rdu0, rdu1);
+        int16x8_t bd0, bd1, gd0, gd1, rd0, rd1;
+        bd0 = vreinterpretq_s16_u16(bdu0);
+        bd1 = vreinterpretq_s16_u16(bdu1);
+        gd0 = vreinterpretq_s16_u16(gdu0);
+        gd1 = vreinterpretq_s16_u16(gdu1);
+        rd0 = vreinterpretq_s16_u16(rdu0);
+        rd1 = vreinterpretq_s16_u16(rdu1);
+
+        int16x8_t vrd0, vrd1, vgd0, vgd1;
+        v_expand(vr, vrd0, vrd1);
+        v_expand(vg, vgd0, vgd1);
+        int16x8_t diffsd0, diffsd1;
+        diffsd0 = vreinterpretq_s16_u16(diffd0);
+        diffsd1 = vreinterpretq_s16_u16(diffd1);
+
+        int16x8_t hd0, hd1;
+        int16x8_t gb = vsubq_s16(gd0, bd0);
+        int16x8_t br = vaddq_s16(vsubq_s16(bd0, rd0), vshlq_n_s16(diffsd0, 1));
+        int16x8_t rg = vaddq_s16(vsubq_s16(rd0, gd0), vshlq_n_s16(diffsd0, 2));
+        hd0 = vaddq_s16(vandq_s16(vrd0, gb),
+                        vandq_s16(vmvnq_s16(vrd0), vaddq_s16(vandq_s16(vgd0, br), vandq_s16(vmvnq_s16(vgd0), rg))));
+        gb = vsubq_s16(gd1, bd1);
+        br = vaddq_s16(vsubq_s16(bd1, rd1), vshlq_n_s16(diffsd1, 1));
+        rg = vaddq_s16(vsubq_s16(rd1, gd1), vshlq_n_s16(diffsd1, 2));
+        hd1 = vaddq_s16(vandq_s16(vrd1, gb),
+                        vandq_s16(vmvnq_s16(vrd1), vaddq_s16(vandq_s16(vgd1, br), vandq_s16(vmvnq_s16(vgd1), rg))));
+
+        int32x4_t hq0, hq1, hq2, hq3;
+        v_expand(hd0, hq0, hq1);
+        v_expand(hd1, hq2, hq3);
+        v_shr<hsv_shift>(hq0, vaddq_s32(vmulq_s32(hq0, hdiv0), vdescale));
+        v_shr<hsv_shift>(hq1, vaddq_s32(vmulq_s32(hq1, hdiv1), vdescale));
+        v_shr<hsv_shift>(hq2, vaddq_s32(vmulq_s32(hq2, hdiv2), vdescale));
+        v_shr<hsv_shift>(hq3, vaddq_s32(vmulq_s32(hq3, hdiv3), vdescale));
+
+        v_pack(hd0, hq0, hq1);
+        v_pack(hd1, hq2, hq3);
+        int16x8_t vhr = vdupq_n_s16(h_range_max);
+        int16x8_t vzd = vdupq_n_s16(0);
+        hd0 = vaddq_s16(hd0, vbslq_s16(vcltq_s16(hd0, vzd), vhr, vzd));
+        hd1 = vaddq_s16(hd1, vbslq_s16(vcltq_s16(hd1, vzd), vhr, vzd));
+        v_pack(h, hd0, hd1);
+
+        vst1q_u8(&out_h[index], h);
+        vst1q_u8(&out_s[index], s);
+        vst1q_u8(&out_v[index], v);
+    }
+
+  private:
+    static inline constexpr void v_expand(const uint8x16_t &src, uint16x8_t &low, uint16x8_t &high) noexcept
+    {
+        low = vmovl_u8(vget_low_u8(src));
+        high = vmovl_u8(vget_high_u8(src));
+    }
+
+    static inline constexpr void v_expand(const uint8x16_t &src, int16x8_t &low, int16x8_t &high) noexcept
+    {
+        low = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(src)));
+        high = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(src)));
+    }
+
+    static inline constexpr void v_expand(const uint16x8_t &src, int32x4_t &low, int32x4_t &high) noexcept
+    {
+        low = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(src)));
+        high = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(src)));
+    }
+
+    static inline constexpr void v_expand(const int16x8_t &src, int32x4_t &low, int32x4_t &high) noexcept
+    {
+        low = vmovl_s16(vget_low_s16(src));
+        high = vmovl_s16(vget_high_s16(src));
+    }
+
+    static inline constexpr void v_lut(int32x4_t &store, const std::array<int, 256> &tab, const int *idx) noexcept
+    {
+        alignas(16) int32_t elems[4]{tab[idx[0]], tab[idx[1]], tab[idx[2]], tab[idx[3]]};
+        store = vld1q_s32(elems);
+    }
+
+    template <size_t N> static inline constexpr void v_shr(int32x4_t &store, const int32x4_t &val) noexcept
+    {
+        store = vshrq_n_s32(val, N);
+    }
+
+    static inline constexpr void v_pack(int16x8_t &store, const int32x4_t &low, const int32x4_t &high) noexcept
+    {
+        store = vcombine_s16(vqmovn_s32(low), vqmovn_s32(high));
+    }
+
+    static inline constexpr void v_pack(uint8x16_t &store, const int16x8_t &low, const int16x8_t &high) noexcept
+    {
+        store = vcombine_u8(vqmovun_s16(low), vqmovun_s16(high));
+    }
+
+  private:
+    static constexpr int h_range_max = HRangeMax;
+    static_assert(h_range_max == 180 || h_range_max == 256);
+    static constexpr int h_scale = h_range_max == 180 ? 15 : 21;
+    static constexpr int hsv_shift = 12;
+
+    static constexpr auto h_div_table{[]() noexcept {
+        std::array<int, 256> table;
+        table[0] = 0;
+        for (size_t i = 1; i < table.size(); ++i)
+        {
+            table[i] = utils::saturate_cast<int>((h_range_max << hsv_shift) / (6. * i));
+        }
+        return table;
+    }()};
+    static constexpr auto s_div_table{[]() noexcept {
+        std::array<int, 256> table;
+        table[0] = 0;
+        for (size_t i = 1; i < table.size(); ++i)
+        {
+            table[i] = utils::saturate_cast<int>((255 << hsv_shift) / (1. * i));
+        }
+        return table;
+    }()};
+};
 
 #endif
 
@@ -272,7 +469,7 @@ class STLParallel final : public Backend<STLParallel>
     static constexpr std::string_view name = "STLParallel";
 
     template <typename... KernelTypes, typename... Args>
-    static inline constexpr size_t operator()(const size_t start, const size_t size, Args &&...args) noexcept
+    static inline constexpr size_t operator()(const size_t start, const size_t size, Args &&...args)
     {
         constexpr size_t seq_data_parallel = traits::cal_kernels_product<KernelTypes...>();
         const size_t remain = size % seq_data_parallel;
@@ -300,7 +497,7 @@ class STLThreads final : public Backend<STLThreads>
     static size_t concurrency_limit;
 
     template <typename... KernelTypes, typename... Args>
-    static inline constexpr size_t operator()(const size_t start, const size_t size, Args &&...args) noexcept
+    static inline constexpr size_t operator()(const size_t start, const size_t size, Args &&...args)
     {
         size_t concurrency = concurrency_limit;
         if (concurrency == 0)
