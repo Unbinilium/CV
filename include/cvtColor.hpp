@@ -679,7 +679,7 @@ namespace cv
             static inline constexpr void dispatch(size_t &start, const size_t end, Args &&...args) noexcept
             {
                 constexpr size_t data_parallel = KernelType::data_parallel;
-                while (start < end)
+                while (start + data_parallel <= end)
                 {
                     KernelType::operator()(start, std::forward<Args>(args)...);
                     start += data_parallel;
