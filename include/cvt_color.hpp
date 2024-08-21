@@ -257,17 +257,14 @@ template <size_t HRangeMax = 180> class RGB2HSVCVNeonAAarch64 final : public Ker
         const uint8x16_t g = vld1q_u8(&in_g[index]);
         const uint8x16_t b = vld1q_u8(&in_b[index]);
 
-        uint8x16_t h, s, v;
-        uint8x16_t vmin;
+        uint8x16_t h, s;
+        const uint8x16_t v = vmaxq_u8(b, vmaxq_u8(g, r));
+        const uint8x16_t vmin = vminq_u8(b, vminq_u8(g, r));
 
-        v = vmaxq_u8(b, vmaxq_u8(g, r));
-        vmin = vminq_u8(b, vminq_u8(g, r));
-
-        uint8x16_t diff, vr, vg;
-        diff = vsubq_u8(v, vmin);
-        uint8x16_t v255 = vdupq_n_u8(255), vz = vdupq_n_u8(0);
-        vr = vbslq_u8(vceqq_u8(v, r), v255, vz);
-        vg = vbslq_u8(vceqq_u8(v, g), v255, vz);
+        const uint8x16_t diff = vsubq_u8(v, vmin);
+        static const uint8x16_t v255 = vdupq_n_u8(255), vz = vdupq_n_u8(0);
+        const uint8x16_t vr = vbslq_u8(vceqq_u8(v, r), v255, vz);
+        const uint8x16_t vg = vbslq_u8(vceqq_u8(v, g), v255, vz);
 
         int32x4_t sdiv0, sdiv1, sdiv2, sdiv3;
         uint16x8_t vd0, vd1;
@@ -308,7 +305,7 @@ template <size_t HRangeMax = 180> class RGB2HSVCVNeonAAarch64 final : public Ker
         }
 
         int32x4_t sq0, sq1, sq2, sq3;
-        int32x4_t vdescale = vdupq_n_s32(1 << (hsv_shift - 1));
+        const int32x4_t vdescale = vdupq_n_s32(1 << (hsv_shift - 1));
         v_shr<hsv_shift>(sq0, vaddq_s32(vmulq_s32(diffq0, sdiv0), vdescale));
         v_shr<hsv_shift>(sq1, vaddq_s32(vmulq_s32(diffq1, sdiv1), vdescale));
         v_shr<hsv_shift>(sq2, vaddq_s32(vmulq_s32(diffq2, sdiv2), vdescale));
@@ -359,10 +356,9 @@ template <size_t HRangeMax = 180> class RGB2HSVCVNeonAAarch64 final : public Ker
 
         v_pack(hd0, hq0, hq1);
         v_pack(hd1, hq2, hq3);
-        int16x8_t vhr = vdupq_n_s16(h_range_max);
-        int16x8_t vzd = vdupq_n_s16(0);
-        hd0 = vaddq_s16(hd0, vbslq_s16(vcltq_s16(hd0, vzd), vhr, vzd));
-        hd1 = vaddq_s16(hd1, vbslq_s16(vcltq_s16(hd1, vzd), vhr, vzd));
+        const int16x8_t vhr = vdupq_n_s16(h_range_max);
+        hd0 = vaddq_s16(hd0, vbslq_s16(vcltq_s16(hd0, vz), vhr, vz));
+        hd1 = vaddq_s16(hd1, vbslq_s16(vcltq_s16(hd1, vz), vhr, vz));
         v_pack(h, hd0, hd1);
 
         vst1q_u8(&out_h[index], h);
@@ -461,17 +457,14 @@ template <size_t HRangeMax = 180> class RGB2HSVCVAVX2 final : public Kernel<RGB2
         const __m256i g = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&in_g[index]));
         const __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&in_b[index]));
 
-        __m256i h, s, v;
-        __m256i vmin;
+        __m256i h, s;
+        const __m256i v = _mm256_max_epu8(b, _mm256_max_epu8(g, r));
+        const __m256i vmin = _mm256_min_epu8(b, _mm256_min_epu8(g, r));
 
-        v = _mm256_max_epu8(b, _mm256_max_epu8(g, r));
-        vmin = _mm256_min_epu8(b, _mm256_min_epu8(g, r));
-
-        __m256i diff, vr, vg;
-        diff = _mm256_subs_epu8(v, vmin);
-        __m256i v255 = _mm256_set1_epi8(255), vz = _mm256_setzero_si256();
-        vr = _mm256_blendv_epi8(v255, vz, _mm256_cmpeq_epi8(v, r));
-        vg = _mm256_blendv_epi8(v255, vz, _mm256_cmpeq_epi8(v, g));
+        const __m256i diff = _mm256_subs_epu8(v, vmin);
+        static const __m256i v255 = _mm256_set1_epi8(255), vz = _mm256_setzero_si256();
+        const __m256i vr = _mm256_blendv_epi8(vz, v255, _mm256_cmpeq_epi8(v, r));
+        const __m256i vg = _mm256_blendv_epi8(vz, v255, _mm256_cmpeq_epi8(v, g));
 
         __m256i sdiv0, sdiv1, sdiv2, sdiv3;
         __m256i vd0, vd1;
@@ -512,7 +505,7 @@ template <size_t HRangeMax = 180> class RGB2HSVCVAVX2 final : public Kernel<RGB2
         }
 
         __m256i sq0, sq1, sq2, sq3;
-        __m256i vdescale = _mm256_set1_epi32(1 << (hsv_shift - 1));
+        const __m256i vdescale = _mm256_set1_epi32(1 << (hsv_shift - 1));
         v_shr_i32x8<hsv_shift>(sq0, _mm256_add_epi32(_mm256_mullo_epi32(diffq0, sdiv0), vdescale));
         v_shr_i32x8<hsv_shift>(sq1, _mm256_add_epi32(_mm256_mullo_epi32(diffq1, sdiv1), vdescale));
         v_shr_i32x8<hsv_shift>(sq2, _mm256_add_epi32(_mm256_mullo_epi32(diffq2, sdiv2), vdescale));
@@ -522,37 +515,28 @@ template <size_t HRangeMax = 180> class RGB2HSVCVAVX2 final : public Kernel<RGB2
         v_pack_i16x16_i32x8(sd1, sq2, sq3);
         v_pack_u8x32_i16x16(s, sd0, sd1);
 
-        __m256i bdu0, bdu1, gdu0, gdu1, rdu0, rdu1;
-        v_expand_u8x32_u16x16(b, bdu0, bdu1);
-        v_expand_u8x32_u16x16(g, gdu0, gdu1);
-        v_expand_u8x32_u16x16(r, rdu0, rdu1);
+
         __m256i bd0, bd1, gd0, gd1, rd0, rd1;
-        bd0 = bdu0;
-        bd1 = bdu1;
-        gd0 = gdu0;
-        gd1 = gdu1;
-        rd0 = rdu0;
-        rd1 = rdu1;
+        v_expand_u8x32_i16x16(b, bd0, bd1);
+        v_expand_u8x32_i16x16(g, gd0, gd1);
+        v_expand_u8x32_i16x16(r, rd0, rd1);
 
         __m256i vrd0, vrd1, vgd0, vgd1;
-        v_expand_u8x32_u16x16(vr, vrd0, vrd1);
-        v_expand_u8x32_u16x16(vg, vgd0, vgd1);
-        __m256i diffsd0, diffsd1;
-        diffsd0 = diffd0;
-        diffsd1 = diffd1;
+        v_expand_u8x32_i16x16(vr, vrd0, vrd1);
+        v_expand_u8x32_i16x16(vg, vgd0, vgd1);
 
         __m256i hd0, hd1;
         __m256i gb = _mm256_sub_epi16(gd0, bd0);
-        __m256i br = _mm256_add_epi16(_mm256_sub_epi16(bd0, rd0), _mm256_slli_epi16(diffsd0, 1));
-        __m256i rg = _mm256_add_epi16(_mm256_sub_epi16(rd0, gd0), _mm256_slli_epi16(diffsd0, 2));
+        __m256i br = _mm256_add_epi16(_mm256_sub_epi16(bd0, rd0), _mm256_slli_epi16(diffd0, 1));
+        __m256i rg = _mm256_add_epi16(_mm256_sub_epi16(rd0, gd0), _mm256_slli_epi16(diffd0, 2));
         hd0 = _mm256_add_epi16(
             _mm256_and_si256(vrd0, gb),
             _mm256_and_si256(_mm256_xor_si256(vrd0, _mm256_set1_epi32(-1)),
                              _mm256_add_epi16(_mm256_and_si256(vgd0, br),
                                               _mm256_and_si256(_mm256_xor_si256(vgd0, _mm256_set1_epi32(-1)), rg))));
         gb = _mm256_sub_epi16(gd1, bd1);
-        br = _mm256_add_epi16(_mm256_sub_epi16(bd1, rd1), _mm256_slli_epi16(diffsd1, 1));
-        rg = _mm256_add_epi16(_mm256_sub_epi16(rd1, gd1), _mm256_slli_epi16(diffsd1, 2));
+        br = _mm256_add_epi16(_mm256_sub_epi16(bd1, rd1), _mm256_slli_epi16(diffd1, 1));
+        rg = _mm256_add_epi16(_mm256_sub_epi16(rd1, gd1), _mm256_slli_epi16(diffd1, 2));
         hd1 = _mm256_add_epi16(
             _mm256_and_si256(vrd1, gb),
             _mm256_and_si256(_mm256_xor_si256(vrd1, _mm256_set1_epi32(-1)),
@@ -569,10 +553,9 @@ template <size_t HRangeMax = 180> class RGB2HSVCVAVX2 final : public Kernel<RGB2
 
         v_pack_i16x16_i32x8(hd0, hq0, hq1);
         v_pack_i16x16_i32x8(hd1, hq2, hq3);
-        __m256i vhr = _mm256_set1_epi16(h_range_max);
-        __m256i vzd = _mm256_setzero_si256();
-        hd0 = _mm256_add_epi16(hd0, _mm256_blendv_epi8(vhr, vzd, _mm256_cmpgt_epi16(vzd, hd0)));
-        hd1 = _mm256_add_epi16(hd1, _mm256_blendv_epi8(vhr, vzd, _mm256_cmpgt_epi16(vzd, hd1)));
+        const __m256i vhr = _mm256_set1_epi16(h_range_max);
+        hd0 = _mm256_add_epi16(hd0, _mm256_blendv_epi8(vz, vhr, _mm256_cmpgt_epi16(vz, hd0)));
+        hd1 = _mm256_add_epi16(hd1, _mm256_blendv_epi8(vz, vhr, _mm256_cmpgt_epi16(vz, hd1)));
         v_pack_u8x32_i16x16(h, hd0, hd1);
 
         _mm256_storeu_si256(reinterpret_cast<__m256i *>(&out_h[index]), h);
@@ -585,6 +568,12 @@ template <size_t HRangeMax = 180> class RGB2HSVCVAVX2 final : public Kernel<RGB2
     {
         low = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(src));
         high = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(src, 1));
+    }
+
+    static inline constexpr void v_expand_u8x32_i16x16(const __m256i &src, __m256i &low, __m256i &high) noexcept
+    {
+        low = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(src));
+        high = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(src, 1));
     }
 
     static inline constexpr void v_expand_u16x16_i32x8(const __m256i &src, __m256i &low, __m256i &high) noexcept
